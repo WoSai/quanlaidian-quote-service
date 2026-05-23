@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 
-from app.api import quote, health, files
+from app.api import quote, health, files, shortlink
 from app.errors import register_exception_handlers
 from app.persistence import init_db
 
@@ -29,3 +29,4 @@ async def add_request_id(request: Request, call_next):
 app.include_router(quote.router)
 app.include_router(health.router)
 app.include_router(files.router)
+app.include_router(shortlink.router)

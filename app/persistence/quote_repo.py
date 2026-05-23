@@ -5,6 +5,7 @@ import secrets
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from app.persistence.db import gen_short_id
 from app.persistence.models import Approval, Quote, QuoteRender
 
 
@@ -125,19 +126,25 @@ def persist_render(
         filename=filename,
         created_at=_now_iso(),
         expires_at=expires_at,
+        short_id=gen_short_id(),
     )
-    conn.execute(
-        """
-        INSERT INTO quote_render (id, quote_id, format, file_token, filename,
-                                  created_at, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            render.id, render.quote_id, render.format, render.file_token,
-            render.filename, render.created_at, render.expires_at,
-        ),
-    )
-    return render
+    for _ in range(5):
+        try:
+            conn.execute(
+                """
+                INSERT INTO quote_render (id, quote_id, format, file_token, filename,
+                                          created_at, expires_at, short_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    render.id, render.quote_id, render.format, render.file_token,
+                    render.filename, render.created_at, render.expires_at, render.short_id,
+                ),
+            )
+            return render
+        except sqlite3.IntegrityError:
+            render.short_id = gen_short_id()
+    raise RuntimeError("无法为 quote_render 生成唯一 short_id")
 
 
 def latest_render(conn: sqlite3.Connection, quote_id: str, format: str) -> Optional[QuoteRender]:
@@ -149,6 +156,13 @@ def latest_render(conn: sqlite3.Connection, quote_id: str, format: str) -> Optio
          LIMIT 1
         """,
         (quote_id, format),
+    ).fetchone()
+    return _row_to_render(row) if row else None
+
+
+def get_render_by_short_id(conn: sqlite3.Connection, short_id: str) -> Optional[QuoteRender]:
+    row = conn.execute(
+        "SELECT * FROM quote_render WHERE short_id=?", (short_id,)
     ).fetchone()
     return _row_to_render(row) if row else None
 
@@ -221,6 +235,7 @@ def _row_to_render(row: sqlite3.Row) -> QuoteRender:
         filename=row["filename"],
         created_at=row["created_at"],
         expires_at=row["expires_at"],
+        short_id=row["short_id"],
     )
 
 

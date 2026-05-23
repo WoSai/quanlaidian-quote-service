@@ -1,6 +1,6 @@
 """Pricing + persistence + render business logic for the /v1/quote endpoint."""
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -24,7 +24,7 @@ from app.persistence.quote_repo import (
     persist_render as _persist_render,
     upsert_approval,
 )
-from app.storage import OssStorage, Storage
+from app.storage import Storage
 
 
 def sanitize(name: str) -> str:
@@ -134,19 +134,14 @@ def render_format(
         )
 
 
-def render_to_file_ref(render: QuoteRender, base_url: str, storage: Storage | None = None) -> FileRef:
-    expires_at = datetime.fromisoformat(render.expires_at)
-    if render.file_token.startswith("http://") or render.file_token.startswith("https://"):
-        url = render.file_token
-    elif isinstance(storage, OssStorage):
-        url, expires_at = storage.resolve_url(render.file_token)
-    else:
-        url = f"{base_url.rstrip('/')}/files/{render.file_token}/{render.filename}"
-    return FileRef(
-        url=url,
-        filename=render.filename,
-        expires_at=expires_at,
-    )
+def render_to_file_ref(render: QuoteRender, base_url: str) -> FileRef:
+    # Return a stable short link; the high-entropy OSS signature is generated
+    # on each visit to /q/{short_id}, never in the chat text. The link never
+    # expires (it re-signs on access), so expires_at is reported as
+    # effectively-permanent rather than the OSS signature window.
+    url = f"{base_url.rstrip('/')}/q/{render.short_id}"
+    expires_at = datetime.fromisoformat(render.created_at) + timedelta(days=3650)
+    return FileRef(url=url, filename=render.filename, expires_at=expires_at)
 
 
 def build_preview(config: dict, form: dict) -> QuotePreview:

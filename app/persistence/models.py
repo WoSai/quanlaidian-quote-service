@@ -26,6 +26,7 @@ class QuoteRender:
     filename: str
     created_at: str
     expires_at: str
+    short_id: Optional[str] = None
 
 
 @dataclass

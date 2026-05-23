@@ -1,7 +1,21 @@
+import secrets
 import sqlite3
+import string
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
+
+_SHORT_ID_ALPHABET = string.ascii_letters + string.digits
+
+
+def gen_short_id(n: int = 10) -> str:
+    """Short, low-entropy, pure-ASCII base62 token for file short links.
+
+    Avoids + / = - _ so it never needs URL-escaping and the LLM that copies
+    it into chat replies has little to mis-transcribe.
+    """
+    return "".join(secrets.choice(_SHORT_ID_ALPHABET) for _ in range(n))
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS quote (
@@ -31,7 +45,8 @@ CREATE TABLE IF NOT EXISTS quote_render (
     file_token  TEXT NOT NULL,
     filename    TEXT NOT NULL,
     created_at  TEXT NOT NULL,
-    expires_at  TEXT NOT NULL
+    expires_at  TEXT NOT NULL,
+    short_id    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_render_quote_format
     ON quote_render(quote_id, format);
@@ -73,11 +88,32 @@ def _connect(path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _migrate_short_id(conn: sqlite3.Connection) -> None:
+    """Add quote_render.short_id to pre-existing databases, then index it.
+
+    The index is created here (not in _SCHEMA) so the column is guaranteed to
+    exist on legacy DBs whose quote_render table predates short_id.
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(quote_render)")}
+    if "short_id" not in cols:
+        conn.execute("ALTER TABLE quote_render ADD COLUMN short_id TEXT")
+    # Backfill existing rows so every render has a short link and the response
+    # path can rely on short_id unconditionally (no legacy fallback).
+    legacy_ids = [r["id"] for r in conn.execute("SELECT id FROM quote_render WHERE short_id IS NULL")]
+    for render_id in legacy_ids:
+        conn.execute("UPDATE quote_render SET short_id=? WHERE id=?", (gen_short_id(), render_id))
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_render_short_id "
+        "ON quote_render(short_id) WHERE short_id IS NOT NULL"
+    )
+
+
 def init_db(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = _connect(path)
     try:
         conn.executescript(_SCHEMA)
+        _migrate_short_id(conn)
     finally:
         conn.close()
 
