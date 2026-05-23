@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS quote_render (
     file_token  TEXT NOT NULL,
     filename    TEXT NOT NULL,
     created_at  TEXT NOT NULL,
-    expires_at  TEXT NOT NULL
+    expires_at  TEXT NOT NULL,
+    short_id    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_render_quote_format
     ON quote_render(quote_id, format);
@@ -73,11 +74,27 @@ def _connect(path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _migrate_short_id(conn: sqlite3.Connection) -> None:
+    """Add quote_render.short_id to pre-existing databases, then index it.
+
+    The index is created here (not in _SCHEMA) so the column is guaranteed to
+    exist on legacy DBs whose quote_render table predates short_id.
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(quote_render)")}
+    if "short_id" not in cols:
+        conn.execute("ALTER TABLE quote_render ADD COLUMN short_id TEXT")
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_render_short_id "
+        "ON quote_render(short_id) WHERE short_id IS NOT NULL"
+    )
+
+
 def init_db(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = _connect(path)
     try:
         conn.executescript(_SCHEMA)
+        _migrate_short_id(conn)
     finally:
         conn.close()
 

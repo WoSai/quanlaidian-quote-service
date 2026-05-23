@@ -75,6 +75,8 @@ def api_client(test_data_root, test_token, monkeypatch):
     monkeypatch.setattr(config_module, "settings", new_settings)
     monkeypatch.setattr("app.api.quote.settings", new_settings)
     monkeypatch.setattr("app.api.health.settings", new_settings, raising=False)
+    monkeypatch.setattr("app.api.files.settings", new_settings, raising=False)
+    monkeypatch.setattr("app.api.shortlink.settings", new_settings, raising=False)
 
     # Override product catalog path lookup when running on a workstation that
     # has the quanlaidian-quotation-skill repo cloned alongside this repo.

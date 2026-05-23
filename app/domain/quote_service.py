@@ -1,6 +1,6 @@
 """Pricing + persistence + render business logic for the /v1/quote endpoint."""
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -135,6 +135,16 @@ def render_format(
 
 
 def render_to_file_ref(render: QuoteRender, base_url: str, storage: Storage | None = None) -> FileRef:
+    if render.short_id:
+        # Return a stable short link; the high-entropy OSS signature is
+        # generated on each visit to /q/{short_id}, never in the chat text.
+        # The link itself never expires (it re-signs on access), so expires_at
+        # is reported as effectively-permanent rather than the OSS sig window.
+        url = f"{base_url.rstrip('/')}/q/{render.short_id}"
+        expires_at = datetime.fromisoformat(render.created_at) + timedelta(days=3650)
+        return FileRef(url=url, filename=render.filename, expires_at=expires_at)
+
+    # Legacy renders (no short_id): keep returning a signed / local URL directly.
     expires_at = datetime.fromisoformat(render.expires_at)
     if render.file_token.startswith("http://") or render.file_token.startswith("https://"):
         url = render.file_token
