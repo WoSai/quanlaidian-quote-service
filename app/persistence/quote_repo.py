@@ -2,10 +2,10 @@ import hashlib
 import json
 import sqlite3
 import secrets
-import string
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from app.persistence.db import gen_short_id
 from app.persistence.models import Approval, Quote, QuoteRender
 
 
@@ -27,18 +27,6 @@ def _gen_id(prefix: str) -> str:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-_SHORT_ID_ALPHABET = string.ascii_letters + string.digits
-
-
-def _gen_short_id(n: int = 10) -> str:
-    """Short, low-entropy, pure-ASCII base62 token for file short links.
-
-    Avoids + / = - _ so it never needs URL-escaping and the LLM that copies
-    it into chat replies has little to mis-transcribe.
-    """
-    return "".join(secrets.choice(_SHORT_ID_ALPHABET) for _ in range(n))
 
 
 def find_by_form_hash(conn: sqlite3.Connection, org: str, form_hash: str) -> Optional[Quote]:
@@ -138,7 +126,7 @@ def persist_render(
         filename=filename,
         created_at=_now_iso(),
         expires_at=expires_at,
-        short_id=_gen_short_id(),
+        short_id=gen_short_id(),
     )
     for _ in range(5):
         try:
@@ -155,7 +143,7 @@ def persist_render(
             )
             return render
         except sqlite3.IntegrityError:
-            render.short_id = _gen_short_id()
+            render.short_id = gen_short_id()
     raise RuntimeError("无法为 quote_render 生成唯一 short_id")
 
 
