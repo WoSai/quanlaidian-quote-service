@@ -84,6 +84,25 @@ def test_short_link_unknown_returns_404(api_client):
     assert client.get("/q/doesnotexist").status_code == 404
 
 
+def test_shortlink_disabled_returns_direct_urls(api_client_no_shortlink, sample_form):
+    """With the module off (default), responses return direct /files/ URLs, not /q/."""
+    client, token = api_client_no_shortlink
+    resp = client.post("/v1/quote", json=sample_form, headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200, resp.text
+    files = resp.json()["files"]
+    for fmt in ("pdf", "xlsx", "json"):
+        url = files[fmt]["url"]
+        assert re.fullmatch(r"http://testserver/files/[^/]+/.+", url), url
+
+
+def test_shortlink_disabled_route_returns_404(api_client_no_shortlink, sample_form):
+    """With the module off, even a valid short_id's /q/ route is 404."""
+    client, token = api_client_no_shortlink
+    # A render (and its short_id) is still created; the redirect route is just gated off.
+    client.post("/v1/quote", json=sample_form, headers={"Authorization": f"Bearer {token}"})
+    assert client.get("/q/anything").status_code == 404
+
+
 def test_short_link_oss_resigns_on_access(api_client, sample_form, monkeypatch):
     """In OSS mode the redirect target is freshly signed at access time."""
     client, token = api_client

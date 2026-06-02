@@ -24,7 +24,7 @@ from app.persistence.quote_repo import (
     persist_render as _persist_render,
     upsert_approval,
 )
-from app.storage import Storage
+from app.storage import OssStorage, Storage
 
 
 def sanitize(name: str) -> str:
@@ -132,6 +132,30 @@ def render_format(
             filename=filename,
             expires_at=expires_at.isoformat(),
         )
+
+
+def resolve_file_url(render: QuoteRender, base_url: str, storage: Storage) -> str:
+    """Resolve a render's persisted file_token into a directly-downloadable URL.
+
+    Shared by the /q/{short_id} redirect and the short-link-disabled response path.
+    """
+    token = render.file_token
+    if token.startswith(("http://", "https://")):
+        return token
+    if isinstance(storage, OssStorage):
+        return storage.resolve_url(token)[0]
+    return f"{base_url.rstrip('/')}/files/{token}/{render.filename}"
+
+
+def render_to_direct_file_ref(render: QuoteRender, base_url: str, storage: Storage) -> FileRef:
+    # Short-link module disabled: return the direct download URL and the render's
+    # real expiry (not the 3650-day short-link window, which only holds because
+    # short links re-sign on access).
+    return FileRef(
+        url=resolve_file_url(render, base_url, storage),
+        filename=render.filename,
+        expires_at=datetime.fromisoformat(render.expires_at),
+    )
 
 
 def render_to_file_ref(render: QuoteRender, base_url: str) -> FileRef:

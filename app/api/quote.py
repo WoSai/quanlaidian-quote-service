@@ -19,6 +19,7 @@ from app.domain.quote_service import (
     build_preview,
     price_and_persist,
     render_format,
+    render_to_direct_file_ref,
     render_to_file_ref,
 )
 from app.domain.schema import FileRef, QuoteForm, QuoteResponse
@@ -99,7 +100,10 @@ def create_quote_legacy(
             storage=storage,
             fonts_dir=fonts_dir,
         )
-        files[fmt] = render_to_file_ref(render, settings.api_base_url)
+        if settings.enable_shortlink:
+            files[fmt] = render_to_file_ref(render, settings.api_base_url)
+        else:
+            files[fmt] = render_to_direct_file_ref(render, settings.api_base_url, storage)
 
     preview = build_preview(config, form_dict)
 
