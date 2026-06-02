@@ -56,9 +56,8 @@ def test_token(test_data_root):
         )
     return plaintext
 
-@pytest.fixture
-def api_client(test_data_root, test_token, monkeypatch):
-    """Create a TestClient with overridden settings."""
+def _make_api_client(test_data_root, test_token, monkeypatch, *, enable_shortlink):
+    """Build a TestClient with overridden settings; shared by api_client fixtures."""
     from app.config import Settings
     import app.config as config_module
 
@@ -68,6 +67,7 @@ def api_client(test_data_root, test_token, monkeypatch):
         data_root=test_data_root,
         file_ttl_days=7,
         storage_backend="local",
+        enable_shortlink=enable_shortlink,
         log_level="WARNING",
     )
 
@@ -88,7 +88,7 @@ def api_client(test_data_root, test_token, monkeypatch):
         monkeypatch.setattr("app.api.quote._get_product_catalog_path", lambda: product_catalog)
 
     from app.main import app
-    from app.auth import verify_token, TokenInfo
+    from app.auth import verify_token
 
     # Override the auth dependency to use the test DB
     db_path = test_data_root / "quote.db"
@@ -99,6 +99,18 @@ def api_client(test_data_root, test_token, monkeypatch):
         yield client, test_token
 
     app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def api_client(test_data_root, test_token, monkeypatch):
+    """TestClient with the short-link module enabled (responses return /q/ links)."""
+    yield from _make_api_client(test_data_root, test_token, monkeypatch, enable_shortlink=True)
+
+
+@pytest.fixture
+def api_client_no_shortlink(test_data_root, test_token, monkeypatch):
+    """TestClient with the short-link module disabled (the default production state)."""
+    yield from _make_api_client(test_data_root, test_token, monkeypatch, enable_shortlink=False)
 
 @pytest.fixture
 def sample_form():

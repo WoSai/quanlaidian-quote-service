@@ -4,6 +4,12 @@
 
 版本号遵循 [SemVer](https://semver.org/lang/zh-CN/);维护流程见 [`README.md`](README.md) "发版与变更日志"章节。
 
+## 1.3.0 (2026-06-02)
+
+### Features
+
+- `feat(shortlink)` 短链模块改为可配置开关,默认**关闭**:新增环境变量 `QUOTE_ENABLE_SHORTLINK`([`app/config.py`](app/config.py))。关闭时 `/v1/quote` 响应的 `files[*].url` 返回直链(本地存储为 `/files/{token}/{filename}`,OSS 为签名直链),`expires_at` 为文件真实过期时间,`/q/{short_id}` 重定向返回 404;设为 `true` 启用后维持原短链行为(`/q/{short_id}` + 访问时重签 OSS 签名)。`short_id` 仍照常生成入库,便于随时开启
+
 ## 1.2.0 (2026-04-28)
 
 ### Features
