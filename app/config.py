@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     data_root: Path = Path("data")
     file_ttl_days: int = 7
     storage_backend: str = "local"
-    enable_shortlink: bool = False
+    enable_shortlink: bool = True
     oss_endpoint: str = "oss-cn-hangzhou.aliyuncs.com"
     oss_bucket: str = "private-wosai-statics"
     oss_prefix: str = "quanlaidian-quote"
