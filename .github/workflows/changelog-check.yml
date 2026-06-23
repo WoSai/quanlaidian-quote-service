@@ -1,0 +1,45 @@
+name: changelog-check
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  changelog-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify CHANGELOG entry for user-visible changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          changed=$(git diff --name-only "$BASE_SHA...$HEAD_SHA")
+          echo "Changed files:"
+          echo "$changed" | sed 's/^/  /'
+
+          # Paths that count as user-visible (server behavior, ops/cron, audit).
+          # Anything outside this list (tests/, scripts/, *.md, .gitignore,
+          # .github/, .gitlab-ci.yml, pyproject.toml, VERSION, CHANGELOG.md)
+          # is exempt — those changes don't need a CHANGELOG entry.
+          if echo "$changed" | grep -qE '^(app/|ops/)'; then
+            if echo "$changed" | grep -qx 'CHANGELOG.md'; then
+              echo "::notice::CHANGELOG.md updated alongside app/|ops/ change — OK"
+              exit 0
+            fi
+            echo "::error::PR touches app/ or ops/ but does not update CHANGELOG.md."
+            echo ""
+            echo "Run scripts/bump_version.py and add a bullet under the new version."
+            echo "If this change is genuinely not user-visible (pure internal refactor),"
+            echo "still add a one-line CHANGELOG entry under '### Internal' so future"
+            echo "readers can see the discipline was applied deliberately."
+            exit 1
+          fi
+          echo "No user-visible paths touched — CHANGELOG entry not required."
