@@ -6,6 +6,8 @@
 
 **版本：** 见 [`VERSION`](VERSION) 与 [`CHANGELOG.md`](CHANGELOG.md);线上版本通过 `GET /healthz` 实时查询。**运行环境:** Python 3.10+ · FastAPI · uvicorn · SQLite
 
+> **2026-09-13 起的当前报价口径：** 产品名称、分类和标准报价全部读取 `references/product_catalog_v2.json`。1–30 店按真实门店数、门店套餐系数 1.00 出主报价；31–49 / 50–99 / 100–199 / 200–300 店分别以下锚点 31 / 50 / 100 / 200 店按 0.95 出主报价，并在阶梯报价中同时展示对应上锚点 49 / 99 / 199 / 300 店按 0.90 的结果；标准报价列始终按 1.00 展示。折扣只作用于门店套餐。实施服务、VIP 售后和权益账户按 `references/quote_rules_v2.json` 与 `docs/pricing-algorithm.md` 执行。旧 Markdown 目录和旧成本算法只保留兼容用途，不得覆盖新版目录和价格。
+
 ---
 
 ## 第一部分 — HTTP API 参考
@@ -55,14 +57,14 @@ python -m app.cli migrate-tokens-json          # 一次性：把旧 data/tokens.
 ```json
 {
   "request_id": "req_…",
-  "pricing_version": "small-segment-v2.3",
+  "pricing_version": "catalog-v2-stage2",
   "preview": {
-    "brand": "海底捞火锅",
-    "meal_type": "正餐",
-    "stores": 30,
-    "package": "正餐连锁营销旗舰版",
-    "discount": 0.19,
-    "totals": { "list": 478920, "final": 115119 },
+    "brand": "新版报价测试",
+    "meal_type": "轻餐",
+    "stores": 50,
+    "package": "轻餐连锁供应链版",
+    "discount": 0.95,
+    "totals": { "list": 121800, "final": 118425 },
     "items": [ /* … */ ]
   },
   "files": {
@@ -82,7 +84,7 @@ python -m app.cli migrate-tokens-json          # 一次性：把旧 data/tokens.
 健康检查 — 无需鉴权。
 
 ```json
-{ "status": "ok", "service_version": "1.1.0", "pricing_version": "small-segment-v2.3" }
+{ "status": "ok", "service_version": "1.3.0", "pricing_version": "catalog-v2-stage2" }
 ```
 
 `service_version` 来自仓库根目录 [`VERSION`](VERSION) 文件,可作为运维 / 调用方确认线上部署版本的唯一权威来源。`pricing_version` 是定价算法版本(随路由策略变化,见 [`/v1/quote`](#post-v1quote--算价--渲染-pdfxlsxjson) 响应中的同名字段)。
@@ -100,18 +102,23 @@ python -m app.cli migrate-tokens-json          # 一次性：把旧 data/tokens.
 | 字段 | 类型 | 必填 | 约束 | 说明 |
 |---|---|---|---|---|
 | `客户品牌名称` | string | ✅ | — | 客户品牌名称 |
+| `餐饮业态` | string | ✅ | 非空 | 例如咖啡、奶茶、火锅，用于推荐餐型及模块 |
 | `餐饮类型` | string | ✅ | `"轻餐"` 或 `"正餐"` | 餐饮类型 |
-| `门店数量` | integer | ✅ | 1 – 300 | 门店数量(301+ 直接 422 走人工定价;31-300 进入大客户段,主报价按下锚点生成 + 阶梯对比页,详见 [定价算法 §5](docs/pricing-algorithm.md)) |
-| `门店套餐` | string | ✅ | — | 套餐名，必须与 [`references/product_catalog.md`](references/product_catalog.md) 一致 |
+| `门店数量` | integer | ✅ | 1 – 300 | 必须填写真实精确数量；301+ 转人工定价；31–300 生成当前区间上下锚点对比 |
+| `所需功能描述` | string | ✅ | 非空 | 点餐收银、会员、小程序、库存、财务软件对接等需求 |
+| `门店套餐` | string | ✅ | — | 套餐名，必须与 [`references/product_catalog_v2.json`](references/product_catalog_v2.json) 一致 |
 | `门店增值模块` | string[] | ❌ | — | 可选门店增值模块 |
 | `总部模块` | string[] | ❌ | — | 可选总部模块 |
 | `配送中心数量` | integer | ❌ | ≥ 0，默认 0 | 配送中心数量 |
 | `生产加工中心数量` | integer | ❌ | ≥ 0，默认 0 | 生产加工中心数量 |
-| `成交价系数` | float | ❌ | 0.01 – 1.0 | 显式成交价系数。**显式提供时 `人工改价原因` 必填** |
-| `人工改价原因` | string | ❌ | 非空 | 显式成交价系数时必填，用于审计留痕 |
+| `企业微信SCRM语鹦版数量` | integer | 条件必填 | ≥ 1 | 选择语鹦版时用于计算企业微信实施费 |
+| `POS交付方式` | string | ❌ | 远程/现场/正餐大酒楼现场 | 省略时默认远程；实施费数量等于主报价门店数 |
+| `是否购买VIP售后服务` | boolean | ❌ | 默认 `false` | 选择后按目录 100 元/门店/年计费 |
+| `成交价系数` | float | 兼容字段 | 0.01 – 1.0 | 最新版 JSON 目录报价会忽略该字段，套餐系数固定按门店阶梯执行；仅旧目录兼容链路保留 |
+| `人工改价原因` | string | 兼容字段 | 非空 | 仅旧目录兼容链路显式改价时使用 |
 | `是否启用阶梯报价` | boolean | ❌ | 默认 `false` | 启用阶梯报价 |
-| `实施服务类型` | string | ❌ | — | 实施服务类型 |
-| `实施服务人天` | integer | ❌ | ≥ 0，默认 0 | 实施服务人天 |
+| `实施服务类型` | string | 兼容字段 | — | 仅旧目录兼容链路使用；最新版目录按套餐及总部模块自动联动实施服务 |
+| `实施服务人天` | integer | 兼容字段 | ≥ 0，默认 0 | 仅旧目录兼容链路使用 |
 
 ---
 
@@ -189,7 +196,7 @@ quanlaidian-quote-service/
 │   │   └── health.py                  # GET /healthz
 │   ├── domain/
 │   │   ├── schema.py                  # Pydantic 请求/响应模型
-│   │   ├── pricing.py                 # 定价算法（small-segment-v2.3）
+│   │   ├── pricing.py                 # 最新目录价格、套餐阶梯及阶段二联动算法
 │   │   ├── pricing_baseline.py        # .obf 运行时解码 + 明文回退
 │   │   ├── quote_service.py           # 算价/渲染业务逻辑
 │   │   ├── render_pdf.py              # reportlab PDF
@@ -205,7 +212,9 @@ quanlaidian-quote-service/
 │   ├── files/                         # 本地生成的文件（仅 local 后端，7 天 TTL）
 │   └── audit/                         # YYYY-MM-DD.jsonl 审计
 ├── references/
-│   ├── product_catalog.md             # 产品目录（对客标价）
+│   ├── product_catalog_v2.json        # 最新产品名称、分类与对客报价（权威来源）
+│   ├── quote_rules_v2.json            # 跨模块购买、实施、售后与权益规则
+│   ├── product_catalog.md             # 旧目录兼容文件
 │   └── pricing_baseline_v5.obf        # 混淆基线（生产首选）
 ├── docs/
 │   └── pricing-algorithm.md           # 定价算法说明（审计参考）
@@ -269,7 +278,7 @@ Pydantic `BaseSettings` 从环境变量读取配置：
 
 #### `app/domain/pricing.py` — 定价算法
 
-从 legacy `build_quotation_config.py` 移植。套餐 `cost × 20` 作标准价 + 成交价系数深折的 SaaS 定价模型；增值模块 `cost × 1.20`、总部模块 `cost × 1.50` 走成本加成毛利保护。详细算法见 [`docs/pricing-algorithm.md`](docs/pricing-algorithm.md)。
+最新版 JSON 目录链路以 `product_catalog_v2.json` 的“对客报价”为全部产品的价格基线，不再用旧成本倍数覆盖新版价格。门店套餐按 1.00 / 0.95 / 0.90 的门店阶梯计算，门店增值、总部模块、实施服务和 VIP 售后均不参与套餐折扣；配送中心、生产加工、企微实施费及权益账户展示按 `quote_rules_v2.json` 联动。旧成本基线仅供旧目录兼容和内部追溯。详细算法见 [`docs/pricing-algorithm.md`](docs/pricing-algorithm.md)。
 
 入口：`build_quotation_config(form_dict, baseline, product_catalog_path) → dict`
 

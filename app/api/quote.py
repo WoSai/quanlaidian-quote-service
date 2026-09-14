@@ -48,13 +48,15 @@ def _get_baseline() -> dict:
 
 def _get_product_catalog_path() -> Path:
     candidates = [
+        Path(__file__).resolve().parent.parent.parent / "references" / "product_catalog_v2.json",
+        Path("/opt/quanlaidian-quote/references/product_catalog_v2.json"),
         Path(__file__).resolve().parent.parent.parent / "references" / "product_catalog.md",
         Path("/opt/quanlaidian-quote/references/product_catalog.md"),
     ]
     for p in candidates:
         if p.exists():
             return p
-    raise PricingError(message="未找到产品目录文件 product_catalog.md")
+    raise PricingError(message="未找到产品目录文件 product_catalog_v2.json 或 product_catalog.md")
 
 
 def _get_product_descriptions_path() -> Path | None:
@@ -120,7 +122,7 @@ def create_quote_legacy(
     effective_stores = int(config.get("门店数量", form.门店数量))
 
     # 标准价合计（list 列之和）
-    list_total = int(preview.totals.list) if preview.totals.list else 0
+    list_total = preview.totals.list if preview.totals.list else 0
 
     log_request(settings.data_root / "audit", {
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -150,4 +152,5 @@ def create_quote_legacy(
         preview=preview,
         files=files,
         pricing_version=response_pricing_version,
+        pricing_info=pricing_info,
     )

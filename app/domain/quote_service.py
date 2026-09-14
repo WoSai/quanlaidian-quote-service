@@ -175,8 +175,8 @@ def build_preview(config: dict, form: dict) -> QuotePreview:
             QuoteItemPreview(
                 name=item["商品名称"],
                 qty=item["数量"],
-                list=int(item.get("标准价", 0) if item.get("标准价") != "赠送" else 0),
-                final=int(item.get("报价小计", 0)),
+                list=item.get("标准价", 0) if item.get("标准价") != "赠送" else 0,
+                final=item.get("报价小计", 0),
             )
         )
     total_list = sum(i.list * i.qty for i in items_preview)
@@ -196,5 +196,4 @@ def build_preview(config: dict, form: dict) -> QuotePreview:
         totals=QuoteTotals(list=total_list, final=total_final),
         items=items_preview,
     )
-
 

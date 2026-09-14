@@ -301,7 +301,10 @@ def fmt_money(val):
     if val is None or val == '赠送':
         return '赠送'
     try:
-        return '{:,}'.format(int(Decimal(str(val)).quantize(Decimal('1'), rounding=ROUND_HALF_UP)))
+        amount = Decimal(str(val)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        if amount == amount.to_integral_value():
+            return f'{int(amount):,}'
+        return f'{amount:,.2f}'
     except:
         return str(val)
 
@@ -326,13 +329,13 @@ def get_deal_price_factor(item_or_tier, default=1.0):
 
 def calc_actual_price(std_price, deal_price_factor):
     raw = Decimal(str(std_price)) * Decimal(str(deal_price_factor))
-    return raw.quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+    return raw.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
 
 def _money_decimal(value, default='0.00'):
     if value in (None, '', '赠送'):
         return Decimal(str(default))
-    return Decimal(str(value)).quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+    return Decimal(str(value)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
 
 
 def get_item_unit_price(item):
@@ -370,7 +373,10 @@ def get_item_cost_subtotal(item):
     return (cost_unit_price * qty).quantize(Decimal('1'), rounding=ROUND_HALF_UP)
 
 
-def get_tier_unit_price(item, tier_factor):
+def get_tier_unit_price(item, tier_factor, tier_store_count=None):
+    if item.get('阶梯计价类型') == '配送中心实施费' and tier_store_count is not None:
+        from app.domain.pricing import delivery_implementation_price
+        return Decimal(str(delivery_implementation_price(int(tier_store_count))))
     if item.get('模块分类') == '门店软件套餐':
         std_price = item.get('标准价', 0)
         if std_price in ('赠送', None):
@@ -660,7 +666,7 @@ def _build_tiered_section(data, styles):
     ]
     table_data = [header]
 
-    cat_order = ['门店软件套餐', '门店增值模块', '总部模块', '实施服务']
+    cat_order = ['门店软件套餐', '门店增值模块', '总部模块', '实施服务', '售后服务']
     categories = {k: [] for k in cat_order}
     for item in items:
         cat = item.get('模块分类', '门店软件套餐')
@@ -674,7 +680,7 @@ def _build_tiered_section(data, styles):
     grand_totals = [Decimal('0'), Decimal('0')]
     cat_header_rows = []
     subtotal_rows = []
-    NO_TIER_DISCOUNT_CATS = {'实施服务'}
+    NO_TIER_DISCOUNT_CATS = {'实施服务', '售后服务'}
     seq = 0
 
     for cat_name in cat_order:
@@ -694,7 +700,7 @@ def _build_tiered_section(data, styles):
             seq += 1
             unit = item.get('单位', '')
             item_qty = item.get('数量', 1)
-            is_per_store = '店' in unit
+            is_per_store = item.get('数量随门店数', '店' in unit)
             unit_price_item = get_item_unit_price(item)
             is_gift = unit_price_item == '赠送'
 
@@ -710,9 +716,12 @@ def _build_tiered_section(data, styles):
                     row.append(Paragraph(_mixed_text('赠送'), styles['CellStyleCenter']))
                 else:
                     d = Decimal(str(get_deal_price_factor(tier))) if apply_tier_discount else Decimal('1')
-                    actual_price = get_tier_unit_price(item, d) if apply_tier_discount else unit_price_item
+                    if item.get('阶梯计价类型'):
+                        actual_price = get_tier_unit_price(item, d, tier['门店数'])
+                    else:
+                        actual_price = get_tier_unit_price(item, d, tier['门店数']) if apply_tier_discount else unit_price_item
                     qty = Decimal(str(tier['门店数'])) if is_per_store else Decimal(str(item_qty))
-                    subtotal = (actual_price * qty).quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+                    subtotal = (actual_price * qty).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
                     idx = 0 if tier is tier_low else 1
                     cat_subtotals[idx] += subtotal
                     row.append(Paragraph(_mixed_text(fmt_money(float(actual_price))), styles['CellStyleRight']))
@@ -858,6 +867,7 @@ def build_custom_template(data, styles):
         '门店增值模块': [],
         '总部模块': [],
         '实施服务': [],
+        '售后服务': [],
     }
 
     for item in items:

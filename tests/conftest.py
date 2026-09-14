@@ -116,8 +116,10 @@ def api_client_no_shortlink(test_data_root, test_token, monkeypatch):
 def sample_form():
     return {
         "客户品牌名称": "集成测试品牌",
+        "餐饮业态": "咖啡",
         "餐饮类型": "轻餐",
         "门店数量": 5,
+        "所需功能描述": "点餐收银、会员、小程序",
         "门店套餐": "轻餐连锁营销基础版",
         "门店增值模块": [],
         "总部模块": [],

@@ -14,7 +14,9 @@ Changes from original:
 
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
+import json
 from pathlib import Path
+import re
 
 from app.domain.pricing_baseline import PRICING_VERSION
 from app.errors import OutOfRangeError
@@ -28,12 +30,15 @@ SMALL_SEGMENT_START_UNIT_PRICE = {
     "正餐": 3000,
 }
 
-# 大客户段(31-300 店)锚点折扣因子 — 业务经验值。
-# 由业务/商务定期 review;调整后重新部署。
-# 锚点之间不做插值:非锚点请求 → resolve_tier_window 返回"夹住"的上下两档。
-LARGE_SEGMENT_ANCHORS: dict[str, list[tuple[int, float]]] = {
-    "轻餐": [(50, 0.15), (100, 0.13), (200, 0.12), (300, 0.11)],
-    "正餐": [(50, 0.18), (100, 0.16), (200, 0.14), (300, 0.13)],
+QUOTE_WINDOWS: tuple[tuple[int, int], ...] = (
+    (31, 49),
+    (50, 99),
+    (100, 199),
+    (200, 300),
+)
+QUOTE_ANCHOR_FACTORS = {
+    **{lower: 0.95 for lower, _upper in QUOTE_WINDOWS},
+    **{upper: 0.90 for _lower, upper in QUOTE_WINDOWS},
 }
 
 PROTECTED_PRODUCT_NAMES = {
@@ -46,14 +51,21 @@ PROTECTED_PRODUCT_NAMES = {
 # - DEFAULT_QTY_ONE：每勾选一次默认数量=1（按号/品牌为单位售卖，前端不再额外
 #   询问数量）。新增同类商品时把名字加进对应集合即可，无需改 schema。
 HQ_MODULE_QUANTITY_FIELDS = {
-    "配送中心": "配送中心数量",
-    "生产加工": "生产加工中心数量",
+    "连锁供应链-配送中心-轻/正餐": "配送中心数量",
+    "生产加工-轻/正餐": "生产加工中心数量",
+    "企微微信SCRM-语鹦版": "企业微信SCRM语鹦版数量",
 }
-HQ_MODULE_DEFAULT_QTY_ONE = {
-    "商家小程序号",
-    "商家小程序号-品牌点位",
-    "企业微信SCRM",
-}
+STORE_POINT_MODULES = {"连锁供应链门店-轻餐", "连锁供应链门店-正餐"}
+INVENTORY_MODULES = {"门店库存管理-轻餐", "门店库存管理-正餐"}
+DELIVERY_CENTER_MODULE = "连锁供应链-配送中心-轻/正餐"
+PRODUCTION_MODULE = "生产加工-轻/正餐"
+WECHAT_SCRM_MODULE = "企微微信SCRM-语鹦版"
+
+DELIVERY_IMPLEMENTATION = "供应链-配送中心交付"
+PRODUCTION_IMPLEMENTATION = "供应链-生产加工交付"
+WECHAT_IMPLEMENTATION = "企业微信实施费"
+VIP_AFTER_SALES = "Vip售后服务"
+RIGHTS_ACCOUNT = "权益账户"
 
 # 不同 SKU 但功能域互斥，不允许同时出现在同一份报价里。
 # 例：「单门店库存」（旗舰版 ZC-04 子项，单店本地模式）与「供应链基础-门店点位」
@@ -68,7 +80,8 @@ MUTUALLY_EXCLUSIVE_MODULES: tuple[frozenset[str], ...] = (
 # 「供应链基础-门店点位」承接订货与收货。门店端缺失此模块时，配送中心
 # 无法落地。门店端模块来源不限：套餐自带子项 或 门店增值模块均可。
 HQ_MODULE_STORE_DEPENDENCIES: dict[str, str] = {
-    "配送中心": "供应链基础-门店点位",
+    DELIVERY_CENTER_MODULE: "供应链门店点位",
+    PRODUCTION_MODULE: "供应链门店点位",
 }
 
 # 旗舰版套餐 → 推荐改选的「全能版」套餐。当销售把旗舰版（自带「单门店库存」，
@@ -99,22 +112,10 @@ def _check_module_conflicts(
             f"门店增值模块「{names}」已包含在所选套餐中，不能重复购买"
         )
     combined = package_sub_names | addon_set
-    for pair in MUTUALLY_EXCLUSIVE_MODULES:
-        clash = pair & combined
-        if len(clash) >= 2:
-            allround = FLAGSHIP_TO_ALLROUND_REROUTE.get(package_name)
-            if allround and pair == frozenset({"单门店库存", "供应链基础-门店点位"}):
-                raise ValueError(
-                    f"「{package_name}」自带「单门店库存」（单店本地模式），不能再勾选"
-                    f"增值模块「供应链基础-门店点位」（连锁供应链路线）。如需配送中心/"
-                    f"跨店调拨等连锁能力，请改选「{allround}」并保留「供应链基础-门店点位」"
-                    f"增值模块（+2600 元/店/年）；如保持单店模式，请去掉「供应链基础-"
-                    f"门店点位」增值模块。"
-                )
-            names = "、".join(sorted(clash))
-            raise ValueError(
-                f"模块「{names}」业务上互斥（单店库存 vs 供应链门店点位为两条互斥路线），不能同时出现在同一份报价中"
-            )
+    has_inventory = bool(combined & INVENTORY_MODULES) or "门店库存管理" in combined
+    has_store_point = bool(combined & STORE_POINT_MODULES) or "供应链门店点位" in combined
+    if has_inventory and has_store_point:
+        raise ValueError("门店库存管理与供应链门店点位属于互斥路线，不能同时选择")
 
 
 def _check_hq_store_dependencies(
@@ -129,26 +130,22 @@ def _check_hq_store_dependencies(
     旗舰版（自带「单门店库存」）+ 配送中心 时，文案会引导改选同价位的全能版。
     """
     store_modules = package_sub_names | set(addon_module_names)
+    has_store_point = bool(store_modules & STORE_POINT_MODULES) or "供应链门店点位" in store_modules
+    has_inventory = bool(store_modules & INVENTORY_MODULES) or "门店库存管理" in store_modules
+    hq_set = set(hq_module_names)
+    if has_inventory and hq_set & {DELIVERY_CENTER_MODULE, PRODUCTION_MODULE}:
+        raise ValueError("门店库存管理与配送中心、生产加工互斥，请改用连锁供应链门店点位路线")
+    if PRODUCTION_MODULE in hq_set and DELIVERY_CENTER_MODULE not in hq_set:
+        raise ValueError("选择生产加工时必须同时选择连锁供应链-配送中心-轻/正餐")
     for hq_module in hq_module_names:
         required = HQ_MODULE_STORE_DEPENDENCIES.get(hq_module)
-        if required and required not in store_modules:
-            allround = FLAGSHIP_TO_ALLROUND_REROUTE.get(package_name)
-            if (
-                allround
-                and hq_module == "配送中心"
-                and "单门店库存" in package_sub_names
-            ):
-                raise ValueError(
-                    f"总部模块「配送中心」需要门店端「供应链基础-门店点位」承接订货与收货。"
-                    f"当前所选「{package_name}」自带「单门店库存」（单店本地模式），与"
-                    f"配送中心互斥。请改选「{allround}」并勾选「供应链基础-门店点位」"
-                    f"增值模块（+2600 元/店/年），或改用「正餐连锁供应链版」/"
-                    f"「轻餐连锁供应链版」（已自带门店点位）。"
-                )
+        if required and not has_store_point:
             raise ValueError(
-                f"总部模块「{hq_module}」依赖门店端「{required}」，"
-                f"请在门店增值模块勾选「{required}」，或改用已含该模块的门店套餐"
+                f"总部模块「{hq_module}」依赖供应链门店点位，"
+                "请选择含该能力的套餐或对应门店增值模块"
             )
+    if has_store_point and DELIVERY_CENTER_MODULE not in hq_set:
+        raise ValueError("供应链门店点位必须搭配连锁供应链-配送中心-轻/正餐使用")
 
 
 def is_protected_product(product_name):
@@ -201,6 +198,38 @@ def parse_money(value):
     return int(float(text))
 
 
+def parse_customer_quote_amount(value):
+    """Extract the first numeric amount from the latest catalog quote text."""
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value or "").replace(",", "")
+    match = re.search(r"(\d+(?:\.\d+)?)\s*元", text)
+    if match is None:
+        match = re.search(r"(\d+(?:\.\d+)?)", text)
+    if match is None:
+        raise ValueError(f"无法从对客报价中解析金额: {value}")
+    return round_money(Decimal(match.group(1)))
+
+
+def delivery_implementation_price(store_count):
+    if store_count <= 10:
+        return 5000
+    if store_count <= 50:
+        return 10000
+    if store_count <= 300:
+        return 20000
+    return 30000
+
+
+def pos_implementation_product_name(meal_type, delivery_mode):
+    if delivery_mode == "正餐大酒楼现场交付":
+        if meal_type != "正餐":
+            raise ValueError("正餐大酒楼现场交付仅适用于正餐")
+        return "正餐大酒楼-现场交付"
+    suffix = "远程交付" if delivery_mode == "远程交付" else "现场交付"
+    return f"{meal_type}版-{suffix}"
+
+
 def round_factor(value):
     return float(Decimal(str(value)).quantize(Decimal("0.00"), rounding=ROUND_HALF_UP))
 
@@ -211,7 +240,10 @@ def round_to_10(value):
 
 
 def round_money(value):
-    return int(Decimal(str(value)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    amount = Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    if amount == amount.to_integral_value():
+        return int(amount)
+    return float(amount)
 
 
 def parse_markdown_table(lines):
@@ -227,6 +259,41 @@ def parse_markdown_table(lines):
 
 
 def load_product_catalog(path: Path):
+    if path.suffix.lower() == ".json":
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        group_map = {
+            "门店标准套餐": "门店套餐",
+            "门店增值模块": "门店增值模块",
+            "总部增值模块": "总部模块",
+            "实施服务": "实施服务",
+            "售后服务": "售后服务",
+            "权益类": "权益类",
+        }
+        products = []
+        for item in payload.get("products", []):
+            display_category = item.get("display_category") or item.get("category")
+            group = group_map.get(display_category)
+            if not group:
+                continue
+            meal_type = item.get("applicable_meal_type")
+            if item.get("name") in {DELIVERY_CENTER_MODULE, PRODUCTION_MODULE}:
+                meal_type = "通用"
+            if meal_type not in {"轻餐", "正餐"}:
+                meal_type = "通用"
+            products.append({
+                "meal_type": meal_type,
+                "group": group,
+                "name": item["name"],
+                "unit": item.get("unit", ""),
+                "price": item.get("customer_quote"),
+                "description": item.get("description", ""),
+                "business_module": item.get("business_module", ""),
+                "legacy_pricing_key": item.get("legacy_pricing_key", ""),
+                "mapping_status": item.get("mapping_status", ""),
+                "price_source": "latest_catalog_v2",
+            })
+        return products
+
     meal_type = None
     group = None
     table_lines = []
@@ -338,6 +405,21 @@ def resolve_product_pricing(product, quote_meal_type, baseline_index):
     group = classify_catalog_group(product["group"])
     name = product["name"]
 
+    if product.get("price_source") == "latest_catalog_v2":
+        standard_price = product.get("price")
+        if not isinstance(standard_price, (int, float)):
+            raise ValueError(f"商品「{name}」需联系售前确认价格，不能自动报价")
+        cost_price = None
+        legacy_key = product.get("legacy_pricing_key") or ""
+        legacy_parts = legacy_key.split("|", 2)
+        if len(legacy_parts) == 3:
+            cost_price = baseline_index["exact"].get(tuple(legacy_parts))
+        if cost_price is None:
+            cost_price = baseline_index["by_name"].get(name)
+        if cost_price is None:
+            cost_price = standard_price
+        return round_money(standard_price), round_money(cost_price), "latest_catalog_v2"
+
     cost_price = baseline_index["exact"].get((quote_meal_type, group, name))
     if cost_price is None:
         cost_price = baseline_index["by_name"].get(name)
@@ -364,42 +446,19 @@ def _small_segment_bucket(store_count):
 
 
 def recommend_base_deal_price_factor_smooth(store_count, meal_type):
-    """Return the discount factor for `store_count` of `meal_type`.
-
-    Two regimes:
-    - 1-30 (small segment): piecewise-linear smooth curve, slope -0.05/19.
-    - {50, 100, 200, 300} (large segment anchors): table lookup.
-
-    31+ non-anchor values (e.g. 56, 150) are NOT directly priced — the caller
-    must first resolve the tier window via `resolve_tier_window(n)` and feed
-    the anchor endpoints into this function. A non-anchor value in 31-300
-    raises ValueError (defensive); > 300 raises OutOfRangeError.
-    """
-    # 新起步锚点：
-    # 轻餐 1 店 1800，正餐 1 店 3000
-    start_factor_map = {
-        "轻餐": SMALL_SEGMENT_START_UNIT_PRICE["轻餐"] / 7600,
-        "正餐": SMALL_SEGMENT_START_UNIT_PRICE["正餐"] / 11120,
-    }
-    start_factor = start_factor_map[meal_type]
-    # 1-30: 沿用原有斜率,每跨 19 店总下降 0.05
-    if store_count <= 20:
-        return start_factor - 0.05 * (store_count - 1) / 19
-    if store_count <= 30:
-        step = 0.05 / 19
-        factor_at_20 = start_factor - 0.05
-        return factor_at_20 - step * (store_count - 20)
-    # 大段超限
+    """Return the confirmed package factor for an exact quote anchor."""
+    if store_count < 1:
+        raise ValueError("门店数量必须大于 0")
+    if store_count <= SMALL_SEGMENT_MAX_STORES:
+        return 1.0
     if store_count > LARGE_SEGMENT_MAX_STORES:
         raise OutOfRangeError(
             field="门店数量",
             message="301店及以上暂不受理，请转人工定价",
             hint="门店数量需在 1–300 之间",
         )
-    # 31-300: 只接受锚点值
-    for anchor_count, anchor_factor in LARGE_SEGMENT_ANCHORS[meal_type]:
-        if store_count == anchor_count:
-            return anchor_factor
+    if store_count in QUOTE_ANCHOR_FACTORS:
+        return QUOTE_ANCHOR_FACTORS[store_count]
     raise ValueError(
         f"非锚点门店数 {store_count},请先调用 resolve_tier_window() 取锚点"
     )
@@ -410,13 +469,11 @@ def resolve_tier_window(store_count: int) -> list[int]:
     large-segment (31-300) range. Boundary rule: left-closed, right-open,
     except the final segment which is right-closed.
 
-    - 30 ≤ n < 50  → [30, 50]   (30 is the small-segment endpoint used as
-                                 the lower reference, not itself an anchor
-                                 in LARGE_SEGMENT_ANCHORS)
-    - 50 ≤ n < 100 → [50, 100]
-    - 100 ≤ n < 200 → [100, 200]
+    - 31 ≤ n ≤ 49  → [31, 49]
+    - 50 ≤ n ≤ 99  → [50, 99]
+    - 100 ≤ n ≤ 199 → [100, 199]
     - 200 ≤ n ≤ 300 → [200, 300]
-    - n < 30: ValueError (that's small-segment single-point territory)
+    - n ≤ 30: ValueError (that's single-point territory)
     - n > 300: OutOfRangeError
     """
     if store_count > LARGE_SEGMENT_MAX_STORES:
@@ -425,26 +482,18 @@ def resolve_tier_window(store_count: int) -> list[int]:
             message="301店及以上暂不受理，请转人工定价",
             hint="门店数量需在 1–300 之间",
         )
-    if store_count < 30:
+    if store_count <= 30:
         raise ValueError(
             f"门店数 {store_count} 属于小段(1-30)单点报价,不应调用 resolve_tier_window"
         )
-    if 30 <= store_count < 50:
-        return [30, 50]
-    if 50 <= store_count < 100:
-        return [50, 100]
-    if 100 <= store_count < 200:
-        return [100, 200]
-    # 200 ≤ store_count ≤ 300
-    return [200, 300]
+    for lower, upper in QUOTE_WINDOWS:
+        if lower <= store_count <= upper:
+            return [lower, upper]
+    raise ValueError(f"无法识别门店数阶梯: {store_count}")
 
 
 def small_segment_bounds(store_count, meal_type):
-    center = recommend_base_deal_price_factor_smooth(store_count, meal_type)
-    bandwidth = 0.02 if meal_type == "轻餐" else 0.015
-    low = max(0.01, center - bandwidth)
-    high = min(1.0, center + bandwidth)
-    return round(low, 6), round(high, 6)
+    return 1.0, 1.0
 
 
 def percentile(sorted_values, q):
@@ -719,7 +768,7 @@ def determine_route_strategy(form):
 
 
 def validate_form(form, product_index, route_strategy):
-    required = ["客户品牌名称", "餐饮类型", "门店数量", "门店套餐"]
+    required = ["客户品牌名称", "餐饮业态", "餐饮类型", "门店数量", "所需功能描述", "门店套餐"]
     missing = [key for key in required if form.get(key) in (None, "", [])]
     if missing:
         raise ValueError(f"缺少必填字段: {', '.join(missing)}")
@@ -737,6 +786,12 @@ def validate_form(form, product_index, route_strategy):
             hint="门店数量需在 1–300 之间",
         )
 
+    delivery_mode = form.get("POS交付方式") or "远程交付"
+    if delivery_mode not in {"远程交付", "现场交付", "正餐大酒楼现场交付"}:
+        raise ValueError("POS交付方式必须为远程交付、现场交付或正餐大酒楼现场交付")
+    if delivery_mode == "正餐大酒楼现场交付" and meal_type != "正餐":
+        raise ValueError("正餐大酒楼现场交付仅适用于正餐")
+
     recommended_factor, chosen_factor, factor_source = normalize_deal_price_factor(form, route_strategy)
 
     package = lookup_product(product_index, form["门店套餐"], meal_type=meal_type, group="门店套餐")
@@ -746,7 +801,7 @@ def validate_form(form, product_index, route_strategy):
     module_names = form.get("门店增值模块", [])
     for module_name in module_names:
         module = lookup_product(product_index, module_name, meal_type=meal_type, group="门店增值模块")
-        if module["meal_type"] != meal_type:
+        if module["meal_type"] not in {meal_type, "通用"}:
             raise ValueError("餐饮类型与门店增值模块不匹配")
 
     protected_overrides = form.get("保护类商品改价", {}) or {}
@@ -765,8 +820,6 @@ def validate_form(form, product_index, route_strategy):
                     raise ValueError(f"勾选总部模块后必须填写 {quantity_field}")
                 if int(form.get(quantity_field, 0)) <= 0:
                     raise ValueError(f"勾选总部模块后 {quantity_field} 必须大于 0")
-            elif module_name not in HQ_MODULE_DEFAULT_QTY_ONE:
-                raise ValueError(f"总部模块不支持: {module_name}")
             lookup_product(product_index, module_name, meal_type=meal_type, group="总部模块")
     for field in ("配送中心数量", "生产加工中心数量"):
         if field in form and int(form[field]) < 0:
@@ -779,6 +832,14 @@ def validate_form(form, product_index, route_strategy):
     if implementation_days > 0 and not implementation_type:
         raise ValueError("填写实施服务人天时必须选择实施服务类型")
 
+    addon_set = set(module_names)
+    if "电子发票税号数-票通" in addon_set and "电子发票接口" not in addon_set:
+        raise ValueError("选择电子发票税号数-票通时必须同时选择电子发票接口")
+    if "宴秘书标准版" in addon_set and "宴秘书接口" in addon_set:
+        raise ValueError("宴秘书标准版已自动授权接口，无需重复选择宴秘书接口")
+    if "宴秘书标准版" in addon_set and "预订管理" in addon_set:
+        raise ValueError("宴秘书标准版已替代预订管理，二者不能重复选择")
+
     return {
         "recommended_factor": recommended_factor,
         "deal_price_factor": chosen_factor,
@@ -786,18 +847,20 @@ def validate_form(form, product_index, route_strategy):
     }
 
 
-def _compute_quote_unit_price(module_category, standard_price, cost_price, deal_price_factor, protected):
-    # 分组定价逻辑：
-    # - 套餐走标准价 × 成交价系数（可打折），走折扣池
-    # - 增值/总部模块是"成本加成"毛利保护：成交价 = 底价 × 固定倍数，
-    #   不随 deal_price_factor 联动（深度折扣不能把这两类砸穿毛利）
-    # - 受保护商品（商管接口）硬等于底价，不允许打折
-    # 这里的 1.20 / 1.50 会超过 compute_standard_price_by_group 算出来的
-    # "标准价"（1.10 / 1.20），所以报价单上会出现"商品单价 > 标准价"的情况。
-    # 这是业务刻意：增值/总部定位为"卖给大连锁，深折被套餐吸收，这两类反而
-    # 加价走"。resolve_product_pricing 的 catalog_fallback 分支在基线缺项时
-    # 会让 cost_price = 目录标价，在此路径下会产出 120%-150% 目录标价的报价
-    # —— 出事时能定位到是基线漏收商品，不是算法问题。
+def _compute_quote_unit_price(
+    module_category,
+    standard_price,
+    cost_price,
+    deal_price_factor,
+    protected,
+    latest_catalog=True,
+):
+    # 新版目录：所有标准价以最新版对客报价为基线，仅门店套餐应用阶梯系数。
+    # Markdown 旧目录分支仅用于历史客户端回归，保留原成本加成算法。
+    if latest_catalog:
+        if module_category == "门店软件套餐":
+            return round_money(Decimal(str(standard_price)) * Decimal(str(deal_price_factor)))
+        return round_money(standard_price)
     if protected:
         return round_money(cost_price)
     if module_category == "门店软件套餐":
@@ -809,7 +872,21 @@ def _compute_quote_unit_price(module_category, standard_price, cost_price, deal_
     return round_money(cost_price)
 
 
-def build_quote_item(product, standard_price, cost_price, quantity, deal_price_factor, category, module_category, description="", sub_items=None):
+def build_quote_item(
+    product,
+    standard_price,
+    cost_price,
+    quantity,
+    deal_price_factor,
+    category,
+    module_category,
+    description="",
+    sub_items=None,
+    latest_catalog=True,
+    quantity_tracks_stores=None,
+    standard_quote_text=None,
+    tier_pricing_kind=None,
+):
     protected = is_protected_product(product["name"])
     quote_unit_price = _compute_quote_unit_price(
         module_category=module_category,
@@ -817,6 +894,7 @@ def build_quote_item(product, standard_price, cost_price, quantity, deal_price_f
         cost_price=cost_price,
         deal_price_factor=deal_price_factor,
         protected=protected,
+        latest_catalog=latest_catalog,
     )
     cost_unit_price = round_money(cost_price)
     subtotal = round_money(Decimal(str(quote_unit_price)) * Decimal(str(quantity)))
@@ -828,7 +906,7 @@ def build_quote_item(product, standard_price, cost_price, quantity, deal_price_f
     item_factor = 1.0 if protected else deal_price_factor
     if standard_price not in (None, "赠送", 0):
         item_factor = round_factor(Decimal(str(quote_unit_price)) / Decimal(str(standard_price)))
-    return {
+    item = {
         "商品分类": category,
         "商品名称": product["name"],
         "单位": product["unit"],
@@ -849,6 +927,13 @@ def build_quote_item(product, standard_price, cost_price, quantity, deal_price_f
         "功能说明": description,
         "子项": list(sub_items) if sub_items else [],
     }
+    if quantity_tracks_stores is not None:
+        item["数量随门店数"] = bool(quantity_tracks_stores)
+    if standard_quote_text is not None:
+        item["标准报价原文"] = str(standard_quote_text)
+    if tier_pricing_kind is not None:
+        item["阶梯计价类型"] = tier_pricing_kind
+    return item
 
 
 def build_internal_financials(items):
@@ -972,6 +1057,11 @@ def build_quotation_config(form: dict, baseline: dict, product_catalog_path: Pat
     )
 
     products = load_product_catalog(product_catalog_path)
+    latest_catalog = product_catalog_path.suffix.lower() == ".json"
+    if latest_catalog:
+        form = dict(form)
+        for key in ("deal_price_factor", "成交价系数", "折扣"):
+            form.pop(key, None)
     baseline_index = build_pricing_baseline_index(baseline)
     product_index = build_product_index(products)
     meal_type = form["餐饮类型"]
@@ -1002,7 +1092,7 @@ def build_quotation_config(form: dict, baseline: dict, product_catalog_path: Pat
         "history_filtered_reason_summary": [],
     }
 
-    if route_strategy == "small-segment":
+    if route_strategy == "small-segment" and product_catalog_path.suffix.lower() != ".json":
         base_for_history = deal_price_factor
         # 仅在自动推荐时启用历史拟合，人工改价保持显式输入优先
         if normalized["factor_source"] == "auto":
@@ -1054,7 +1144,10 @@ def build_quotation_config(form: dict, baseline: dict, product_catalog_path: Pat
     items = []
 
     def _desc_for(product):
-        return get_description(descriptions, product.get("meal_type", meal_type), product["name"])
+        return (
+            get_description(descriptions, product.get("meal_type", meal_type), product["name"])
+            or product.get("description", "")
+        )
 
     package = lookup_product(product_index, form["门店套餐"], meal_type=meal_type, group="门店套餐")
     package_standard_price, package_cost_price, _ = resolve_product_pricing(package, meal_type, baseline_index)
@@ -1065,10 +1158,16 @@ def build_quotation_config(form: dict, baseline: dict, product_catalog_path: Pat
     items.append(build_quote_item(
         package, package_standard_price, package_cost_price, store_count, deal_price_factor,
         "标准软件套餐", "门店软件套餐",
-        description=package_desc, sub_items=package_subs,
+        description=package_desc, sub_items=package_subs, latest_catalog=latest_catalog,
+        quantity_tracks_stores=True,
     ))
 
     package_sub_names = {sub.get("商品名称") for sub in package_subs if sub.get("商品名称")}
+    package_description = package.get("description", "")
+    if "门店库存管理" in package_description:
+        package_sub_names.add("门店库存管理")
+    if "供应链基础-门店点位" in package_description or "连锁供应链门店" in package_description:
+        package_sub_names.add("供应链门店点位")
     _check_module_conflicts(package["name"], package_sub_names, form.get("门店增值模块", []))
     _check_hq_store_dependencies(
         package["name"], package_sub_names, form.get("门店增值模块", []), form.get("总部模块", [])
@@ -1078,27 +1177,7 @@ def build_quotation_config(form: dict, baseline: dict, product_catalog_path: Pat
         module = lookup_product(product_index, module_name, meal_type=meal_type, group="门店增值模块")
         category = "保护类商品" if is_protected_product(module["name"]) else "增值模块"
         standard_price, cost_price, _ = resolve_product_pricing(module, meal_type, baseline_index)
-        items.append(build_quote_item(module, standard_price, cost_price, store_count, deal_price_factor, category, "门店增值模块", description=_desc_for(module)))
-
-    # 电子发票接口 → 自动追加「电子发票-税号」一行（issue #8 联动规则，
-    # 历史回归：4d5ed02 实现，3a19708 HQ 模块重构时被误删，此处恢复）。
-    # 数量取 form["税号数量"]，缺失/非法时按 schema 默认 1。
-    if "电子发票接口" in form.get("门店增值模块", []):
-        tax_id_product = lookup_product(product_index, "电子发票-税号", meal_type=meal_type, group="门店增值模块")
-        tax_id_standard, tax_id_cost, _ = resolve_product_pricing(tax_id_product, meal_type, baseline_index)
-        try:
-            tax_id_qty = int(form.get("税号数量", 1) or 1)
-        except (TypeError, ValueError):
-            tax_id_qty = 1
-        if tax_id_qty < 1:
-            tax_id_qty = 1
-        tax_id_category = "保护类商品" if is_protected_product(tax_id_product["name"]) else "增值模块"
-        items.append(build_quote_item(
-            tax_id_product, tax_id_standard, tax_id_cost,
-            tax_id_qty, deal_price_factor,
-            tax_id_category, "门店增值模块",
-            description=_desc_for(tax_id_product),
-        ))
+        items.append(build_quote_item(module, standard_price, cost_price, store_count, deal_price_factor, category, "门店增值模块", description=_desc_for(module), latest_catalog=latest_catalog, quantity_tracks_stores=True))
 
     for module_name in form.get("总部模块", []):
         quantity_field = HQ_MODULE_QUANTITY_FIELDS.get(module_name)
@@ -1106,21 +1185,79 @@ def build_quotation_config(form: dict, baseline: dict, product_catalog_path: Pat
             quantity = int(form.get(quantity_field, 0))
             if quantity <= 0:
                 continue
-        elif module_name in HQ_MODULE_DEFAULT_QTY_ONE:
-            quantity = 1
         else:
-            raise ValueError(f"总部模块不支持: {module_name}")
+            quantity = 1
         module = lookup_product(product_index, module_name, meal_type=meal_type, group="总部模块")
         category = "保护类商品" if is_protected_product(module["name"]) else "总部模块"
         standard_price, cost_price, _ = resolve_product_pricing(module, meal_type, baseline_index)
-        items.append(build_quote_item(module, standard_price, cost_price, quantity, deal_price_factor, category, "总部模块", description=_desc_for(module)))
+        items.append(build_quote_item(module, standard_price, cost_price, quantity, deal_price_factor, category, "总部模块", description=_desc_for(module), latest_catalog=latest_catalog, quantity_tracks_stores=False))
+
+    def append_stage2_item(
+        name,
+        quantity,
+        module_category="实施服务",
+        quantity_tracks_stores=False,
+        unit_price=None,
+        tier_pricing_kind=None,
+    ):
+        product = lookup_product(product_index, name, group=module_category)
+        quote_text = product.get("price")
+        numeric_price = unit_price if unit_price is not None else parse_customer_quote_amount(quote_text)
+        description = _desc_for(product)
+        if str(quote_text) not in description:
+            description = f"{description}\n标准报价原文：{quote_text}".strip()
+        items.append(build_quote_item(
+            product,
+            numeric_price,
+            numeric_price,
+            quantity,
+            1.0,
+            module_category,
+            module_category,
+            description=description,
+            latest_catalog=True,
+            quantity_tracks_stores=quantity_tracks_stores,
+            standard_quote_text=quote_text,
+            tier_pricing_kind=tier_pricing_kind,
+        ))
+
+    if latest_catalog:
+        delivery_mode = form.get("POS交付方式") or "远程交付"
+        pos_service_name = pos_implementation_product_name(meal_type, delivery_mode)
+        append_stage2_item(pos_service_name, store_count, quantity_tracks_stores=True)
+
+        hq_set = set(form.get("总部模块", []))
+        if DELIVERY_CENTER_MODULE in hq_set:
+            append_stage2_item(
+                DELIVERY_IMPLEMENTATION,
+                1,
+                unit_price=delivery_implementation_price(store_count),
+                tier_pricing_kind="配送中心实施费",
+            )
+        if PRODUCTION_MODULE in hq_set:
+            append_stage2_item(
+                PRODUCTION_IMPLEMENTATION,
+                int(form.get("生产加工中心数量", 0)),
+            )
+        if WECHAT_SCRM_MODULE in hq_set:
+            append_stage2_item(
+                WECHAT_IMPLEMENTATION,
+                int(form.get("企业微信SCRM语鹦版数量", 1)),
+            )
+        if as_bool(form.get("是否购买VIP售后服务"), default=False):
+            append_stage2_item(
+                VIP_AFTER_SALES,
+                store_count,
+                module_category="售后服务",
+                quantity_tracks_stores=True,
+            )
 
     implementation_type = form.get("实施服务类型")
     implementation_days = int(form.get("实施服务人天", 0) or 0)
-    if implementation_type and implementation_days > 0:
+    if not latest_catalog and implementation_type and implementation_days > 0:
         service = lookup_product(product_index, implementation_type, group="实施服务")
         standard_price, cost_price, _ = resolve_product_pricing(service, meal_type, baseline_index)
-        items.append(build_quote_item(service, standard_price, cost_price, implementation_days, 1.0, "实施服务", "实施服务", description=_desc_for(service)))
+        items.append(build_quote_item(service, standard_price, cost_price, implementation_days, 1.0, "实施服务", "实施服务", description=_desc_for(service), latest_catalog=latest_catalog, quantity_tracks_stores=False))
 
     protected_bypass_count = sum(1 for item in items if item.get("protected_item_bypass"))
     if protected_bypass_count > 0:
@@ -1163,7 +1300,7 @@ def build_quotation_config(form: dict, baseline: dict, product_catalog_path: Pat
             "route_reason": route_reason,
             "algorithm_version": (
                 PRICING_VERSION if route_strategy == "small-segment"
-                else ("large-segment-v1" if route_strategy == "large-segment" else "legacy-v1")
+                else ("catalog-v2-tiered-stage2" if route_strategy == "large-segment" else "legacy-v1")
             ),
             "sample_bucket": sample_bucket,
             "base_factor": round_factor(recommended_factor),
@@ -1197,7 +1334,17 @@ def build_quotation_config(form: dict, baseline: dict, product_catalog_path: Pat
         },
     }
 
-    annotation = get_annotation_block(descriptions, "权益类自助充值模块")
+    annotation = None
+    if latest_catalog:
+        rights = lookup_product(product_index, RIGHTS_ACCOUNT, group="权益类")
+        rights_text = str(rights.get("price") or "")
+        annotation = {
+            "title": RIGHTS_ACCOUNT,
+            "category": "权益类（固定展示，不计入报价合计）",
+            "text_lines": rights_text.splitlines(),
+        }
+    else:
+        annotation = get_annotation_block(descriptions, "权益类自助充值模块")
     if annotation:
         config["附加说明"] = [annotation]
 

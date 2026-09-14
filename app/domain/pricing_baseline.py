@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from secrets import token_bytes
 
-PRICING_VERSION = "small-segment-v2.3"
+PRICING_VERSION = "catalog-v2-stage2"
 
 OBFUSCATION_FORMAT = "pricing-baseline-obf-v1"
 KEY_ENV = "PRICING_BASELINE_KEY"

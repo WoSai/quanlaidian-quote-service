@@ -230,6 +230,13 @@ def _xl_data_style(cell, align='center', bold=False, bg=None, num_format=None):
     if num_format:
         cell.number_format = num_format
 
+
+def _xl_money_value(value):
+    amount = Decimal(str(value)).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+    if amount == amount.to_integral_value():
+        return int(amount)
+    return float(amount)
+
 def _xl_total_style(cell, align='right'):
     """Excel 合计行样式"""
     from openpyxl.styles import Font, PatternFill, Alignment
@@ -301,16 +308,16 @@ def _xl_write_item_table(ws, items, start_row, sheet_name='', compute_values=Fal
             c = ws.cell(row=current_row, column=6, value='赠送')
             _xl_data_style(c, align='center', bg=bg)
         else:
-            c = ws.cell(row=current_row, column=6, value=int(unit_price_d))
-            _xl_data_style(c, align='right', bg=bg, num_format='#,##0')
+            c = ws.cell(row=current_row, column=6, value=_xl_money_value(unit_price_d))
+            _xl_data_style(c, align='right', bg=bg, num_format='#,##0.00')
 
         # G: 小计
         if is_gift:
             c = ws.cell(row=current_row, column=7, value='赠送')
             _xl_data_style(c, align='center', bg=bg)
         else:
-            c = ws.cell(row=current_row, column=7, value=int(subtotal_d))
-            _xl_data_style(c, align='right', bg=bg, num_format='#,##0')
+            c = ws.cell(row=current_row, column=7, value=_xl_money_value(subtotal_d))
+            _xl_data_style(c, align='right', bg=bg, num_format='#,##0.00')
 
         # H: 功能说明 (multi-line wrap)
         description = item.get('功能说明', '') or ''
@@ -366,7 +373,7 @@ def _xl_write_item_table(ws, items, start_row, sheet_name='', compute_values=Fal
     c = ws.cell(row=total_row, column=7,
                 value=f'=SUM(G{data_start}:G{last_data_row})')
     _xl_total_style(c, align='right')
-    c.number_format = '#,##0'
+    c.number_format = '#,##0.00'
 
     # H: 功能说明 合计行留空
     _xl_total_style(ws.cell(row=total_row, column=8))
@@ -645,6 +652,7 @@ def _generate_xlsx_custom(data):
         '门店增值模块': [],
         '总部模块': [],
         '实施服务': [],
+        '售后服务': [],
     }
 
     for item in items:
@@ -721,6 +729,20 @@ def _generate_xlsx_custom(data):
         _, total_row = _xl_write_item_table(ws, categories['实施服务'], 4, compute_values=True)
         ws.freeze_panes = 'A5'
         cat_totals['实施服务'] = (f'G{total_row}', ws.title)
+
+    if categories.get('售后服务'):
+        ws = wb.create_sheet('售后服务')
+        ws.sheet_view.showGridLines = False
+        _xl_set_col_widths(ws)
+        _xl_add_header_logos(ws)
+        ws.merge_cells('A2:H2')
+        c = ws.cell(row=2, column=1, value='售后服务')
+        _xl_title_style(c, size=14)
+        ws.row_dimensions[2].height = 30
+        ws.row_dimensions[3].height = 8
+        _, total_row = _xl_write_item_table(ws, categories['售后服务'], 4, compute_values=True)
+        ws.freeze_panes = 'A5'
+        cat_totals['售后服务'] = (f'G{total_row}', ws.title)
 
     # ── 封面追加：权益类自助充值模块 注释区块 ──
     r = cover_summary_start_row
@@ -808,7 +830,7 @@ def _xl_add_tiered_sheet(wb, data):
     current_row = 4
     seq = 0
 
-    cat_order = ['门店软件套餐', '门店增值模块', '总部模块', '实施服务']
+    cat_order = ['门店软件套餐', '门店增值模块', '总部模块', '实施服务', '售后服务']
     categories = {k: [] for k in cat_order}
     for item in items:
         cat = item.get('模块分类', '门店软件套餐')
@@ -820,7 +842,7 @@ def _xl_add_tiered_sheet(wb, data):
             categories['门店软件套餐'].append(item)
 
     grand_totals = [Decimal('0'), Decimal('0')]
-    NO_TIER_DISCOUNT_CATS = {'实施服务'}
+    NO_TIER_DISCOUNT_CATS = {'实施服务', '售后服务'}
 
     SUBTOTAL_BG = 'FFF5D6'
     TOTAL_BG = 'FFE082'
@@ -851,7 +873,7 @@ def _xl_add_tiered_sheet(wb, data):
             seq += 1
             unit = item.get('单位', '')
             item_qty = item.get('数量', 1)
-            is_per_store = '店' in unit
+            is_per_store = item.get('数量随门店数', '店' in unit)
             unit_price_item = get_item_unit_price(item)
             is_gift = unit_price_item == '赠送'
 
@@ -882,19 +904,22 @@ def _xl_add_tiered_sheet(wb, data):
                         cc.alignment = Alignment(horizontal='center', vertical='center')
                 else:
                     d = Decimal(str(get_deal_price_factor(tier))) if apply_tier_discount else Decimal('1')
-                    actual_price = get_tier_unit_price(item, d) if apply_tier_discount else unit_price_item
+                    if item.get('阶梯计价类型'):
+                        actual_price = get_tier_unit_price(item, d, tier['门店数'])
+                    else:
+                        actual_price = get_tier_unit_price(item, d, tier['门店数']) if apply_tier_discount else unit_price_item
                     qty = Decimal(str(tier['门店数'])) if is_per_store else Decimal(str(item_qty))
-                    subtotal = (actual_price * qty).quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+                    subtotal = (actual_price * qty).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
                     cat_subtotals[ti] += subtotal
                     # 单价
-                    cu = ws.cell(row=current_row, column=col_unit, value=int(actual_price))
+                    cu = ws.cell(row=current_row, column=col_unit, value=_xl_money_value(actual_price))
                     cu.font = Font(name='微软雅黑', size=9)
-                    cu.number_format = '#,##0'
+                    cu.number_format = '#,##0.00'
                     cu.alignment = Alignment(horizontal='right', vertical='center')
                     # 小计
-                    cs = ws.cell(row=current_row, column=col_sub, value=int(subtotal))
+                    cs = ws.cell(row=current_row, column=col_sub, value=_xl_money_value(subtotal))
                     cs.font = Font(name='微软雅黑', size=9)
-                    cs.number_format = '#,##0'
+                    cs.number_format = '#,##0.00'
                     cs.alignment = Alignment(horizontal='right', vertical='center')
 
             # I: 功能说明
@@ -913,9 +938,9 @@ def _xl_add_tiered_sheet(wb, data):
         for ti, sub in enumerate(cat_subtotals):
             grand_totals[ti] += sub
             col = 6 + ti * 2  # F=6, H=8
-            cc = ws.cell(row=current_row, column=col, value=int(sub))
+            cc = ws.cell(row=current_row, column=col, value=_xl_money_value(sub))
             cc.font = Font(name='微软雅黑', bold=True, size=9)
-            cc.number_format = '#,##0'
+            cc.number_format = '#,##0.00'
             cc.alignment = Alignment(horizontal='right', vertical='center')
         _apply_bg((ws.cell(row=current_row, column=col) for col in range(1, 10)), SUBTOTAL_BG)
         ws.row_dimensions[current_row].height = 18
@@ -927,9 +952,9 @@ def _xl_add_tiered_sheet(wb, data):
     c.alignment = Alignment(horizontal='center', vertical='center')
     for ti, tot in enumerate(grand_totals):
         col = 6 + ti * 2
-        cc = ws.cell(row=current_row, column=col, value=int(tot))
+        cc = ws.cell(row=current_row, column=col, value=_xl_money_value(tot))
         cc.font = Font(name='微软雅黑', bold=True, size=10, color='CC8800')
-        cc.number_format = '#,##0'
+        cc.number_format = '#,##0.00'
         cc.alignment = Alignment(horizontal='right', vertical='center')
     _apply_bg((ws.cell(row=current_row, column=col) for col in range(1, 10)), TOTAL_BG)
     ws.row_dimensions[current_row].height = 22

@@ -231,7 +231,7 @@ def test_quote_same_form_is_idempotent(api_client, sample_form, test_data_root):
 def test_quote_pricing_version_small_segment(api_client, sample_form):
     """Top-level pricing_version must reflect the route actually used.
 
-    Small-segment route (≤30 stores) → "small-segment-v2.3" (current PRICING_VERSION).
+    Small-segment route (≤30 stores) → "catalog-v2-stage2".
     """
     client, token = api_client
     sample_form["门店数量"] = 20
@@ -241,7 +241,7 @@ def test_quote_pricing_version_small_segment(api_client, sample_form):
         headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["pricing_version"] == "small-segment-v2.3"
+    assert resp.json()["pricing_version"] == "catalog-v2-stage2"
 
 
 def test_quote_pricing_version_large_segment(api_client, sample_form):
@@ -259,7 +259,7 @@ def test_quote_pricing_version_large_segment(api_client, sample_form):
         headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 200, resp.text
-    assert resp.json()["pricing_version"] == "large-segment-v1"
+    assert resp.json()["pricing_version"] == "catalog-v2-tiered-stage2"
 
 
 def test_quote_200_29_stores(api_client, sample_form):
